@@ -1235,7 +1235,7 @@ class DefaultXmppOmemoController implements XmppOmemoController {
       OMEMO_DEVICELIST_NODE,
       xml(
         "item",
-        {},
+        { id: "current" },
         xml(
           "list",
           { xmlns: NS_OMEMO },
@@ -1262,7 +1262,7 @@ class DefaultXmppOmemoController implements XmppOmemoController {
       omemoBundleNode(this.state.signal.deviceId),
       xml(
         "item",
-        {},
+        { id: "current" },
         xml(
           "bundle",
           { xmlns: NS_OMEMO },
