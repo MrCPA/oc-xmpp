@@ -10,12 +10,21 @@ import { dispatchInboundReplyWithBase } from "openclaw/plugin-sdk/inbound-reply-
 import type { PluginRuntime, OpenClawConfig } from "openclaw/plugin-sdk/core";
 
 import { parseXmppJid, normalizeXmppBareJid } from "./ids.js";
+import {
+  createXmppMessageKey,
+  extractTimestampFromDelayStamp,
+  resolveDirectMessageBody,
+  resolveMucNickFromJid,
+  resolveXmppMessageId,
+  senderDisplayName,
+  shouldIgnoreDirectMessage,
+  shouldIgnoreRoomMessage,
+} from "./inbound-helpers.js";
 import type { XmppOmemoController } from "./omemo.js";
 import {
   createSeenMessageTracker,
   isXmppSenderAllowed,
   shouldHandleRoomMessage,
-  shouldIgnoreDelayedRoomMessage,
 } from "./policy.js";
 import { sendXmppTextMessage } from "./send.js";
 import type { ResolvedXmppAccount } from "./channel.js";
@@ -42,31 +51,20 @@ function extractText(payload: unknown): string {
 }
 
 function xmppMessageId(stanza: XmppElement, fallbackSeed: string): string {
-  const raw = stanza.attrs.id?.trim();
-  if (raw) return raw;
-  return `xmpp-${fallbackSeed}-${Date.now()}`;
-}
-
-function senderDisplayName(fromBare: string, resource?: string): string {
-  return resource?.trim() || fromBare;
+  return resolveXmppMessageId({
+    stanzaId: stanza.attrs.id,
+    fallbackSeed,
+  });
 }
 
 function resolveMucNick(account: ResolvedXmppAccount): string {
-  const parsed = parseXmppJid(account.jid);
-  const bare = parsed?.bare ?? account.jid;
-  const at = bare.indexOf("@");
-  if (at > 0) return bare.slice(0, at);
-  return "openclaw";
+  return resolveMucNickFromJid(account.jid);
 }
 
 function extractTimestamp(stanza: XmppElement): number {
-  const delay = stanza.getChild("delay", "urn:xmpp:delay");
-  const delayedStamp = delay?.attrs.stamp;
-  if (delayedStamp) {
-    const parsed = Date.parse(delayedStamp);
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return Date.now();
+  return extractTimestampFromDelayStamp(
+    stanza.getChild("delay", "urn:xmpp:delay")?.attrs.stamp
+  );
 }
 
 function hasDelayStamp(stanza: XmppElement): boolean {
@@ -250,7 +248,7 @@ export async function startXmppInboundLoop(
 
   const handleDirectMessage = async (stanza: XmppElement) => {
     const from = parseXmppJid(stanza.attrs.from ?? "");
-    if (!from?.bare || from.bare === botBareJid) return;
+    if (shouldIgnoreDirectMessage({ fromBare: from?.bare, botBareJid })) return;
 
     const encryptedResult = await ctx.omemo?.handleInboundEncryptedDm({
       from: from.bare,
@@ -265,9 +263,11 @@ export async function startXmppInboundLoop(
       },
     });
 
-    const rawBody = encryptedResult?.handled
-      ? encryptedResult.body?.trim() ?? ""
-      : stanza.getChildText("body")?.trim() ?? "";
+    const rawBody = resolveDirectMessageBody({
+      encryptedHandled: Boolean(encryptedResult?.handled),
+      encryptedBody: encryptedResult?.body,
+      plaintextBody: stanza.getChildText("body"),
+    });
     if (!rawBody) return;
 
     if (!encryptedResult?.handled) {
@@ -316,19 +316,24 @@ export async function startXmppInboundLoop(
 
   const handleRoomMessage = async (stanza: XmppElement) => {
     const from = parseXmppJid(stanza.attrs.from ?? "");
-    if (!from?.bare) return;
-
     const timestamp = extractTimestamp(stanza);
-    if (shouldIgnoreDelayedRoomMessage({ isDelayed: hasDelayStamp(stanza), timestamp })) {
-      ctx.log?.debug?.(
-        `[${ctx.account.accountId}] ignoring delayed XMPP room history for ${from.bare}`
-      );
+    const rawBody = stanza.getChildText("body")?.trim() ?? "";
+    const roomDecision = shouldIgnoreRoomMessage({
+      fromBare: from?.bare,
+      fromResource: from?.resource,
+      botNick,
+      body: rawBody,
+      isDelayed: hasDelayStamp(stanza),
+      timestamp,
+    });
+    if (roomDecision.ignore) {
+      if (roomDecision.reason === "delayed-history" && from?.bare) {
+        ctx.log?.debug?.(
+          `[${ctx.account.accountId}] ignoring delayed XMPP room history for ${from.bare}`
+        );
+      }
       return;
     }
-
-    const rawBody = stanza.getChildText("body")?.trim() ?? "";
-    if (!rawBody) return;
-    if ((from.resource ?? "").trim() === botNick) return;
 
     const senderRealJid = extractMucRealJid(stanza);
     const gate = shouldHandleRoomMessage({
@@ -426,8 +431,11 @@ export async function startXmppInboundLoop(
     if (!stanza.is("message")) return;
 
     const from = parseXmppJid(stanza.attrs.from ?? "");
-    const dedupeFrom = from?.bare ?? String(stanza.attrs.from ?? "unknown");
-    const messageKey = `${dedupeFrom}#${xmppMessageId(stanza, dedupeFrom)}`;
+    const messageKey = createXmppMessageKey({
+      fromBare: from?.bare,
+      rawFrom: String(stanza.attrs.from ?? "unknown"),
+      stanzaId: stanza.attrs.id,
+    });
     if (!seenMessageIds.mark(messageKey)) {
       ctx.log?.debug?.(
         `[${ctx.account.accountId}] skipping duplicate XMPP message ${messageKey}`
