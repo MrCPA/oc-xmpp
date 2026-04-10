@@ -1,0 +1,63 @@
+{
+  "id": "xmpp",
+  "kind": "channel",
+  "channels": ["xmpp"],
+  "name": "XMPP",
+  "description": "XMPP channel plugin scaffold for OpenClaw",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "xmpp": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jid": { "type": "string", "description": "Bot JID, for example agent@talk.ruzicka.us" },
+          "password": { "type": "string", "description": "Bot account password or app password" },
+          "service": { "type": "string", "description": "XMPP service URL, for example xmpps://talk.ruzicka.us:5223 or xmpp://talk.ruzicka.us:5222" },
+          "chatDomain": { "type": "string", "description": "Optional XMPP domain used for chat addressing" },
+          "mucService": { "type": "string", "description": "Optional MUC service, for example conference.talk.ruzicka.us" },
+          "mediaMaxMb": { "type": "number", "description": "Future outbound media limit" },
+          "dm": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "policy": {
+                "type": "string",
+                "enum": ["allowlist", "open", "pairing"],
+                "description": "Direct-message access policy"
+              },
+              "allowFrom": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Allowed sender JIDs"
+              }
+            }
+          },
+          "groups": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "policy": {
+                "type": "string",
+                "enum": ["allowlist", "all"],
+                "description": "Group/MUC monitoring policy"
+              },
+              "allowed": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Allowed room JIDs"
+              },
+              "replyPolicy": {
+                "type": "string",
+                "enum": ["dm-allowlist", "mention-only", "open"],
+                "description": "When to reply in rooms"
+              }
+            }
+          }
+        },
+        "required": ["jid", "password", "service"]
+      }
+    }
+  }
+}

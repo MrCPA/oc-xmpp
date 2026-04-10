@@ -1,0 +1,55 @@
+{
+  "name": "@openclaw/xmpp",
+  "version": "0.0.1",
+  "description": "OpenClaw XMPP channel plugin scaffold for bot and MUC messaging",
+  "type": "module",
+  "license": "GPL-3.0-only",
+  "author": "OpenClaw Contributors",
+  "keywords": [
+    "openclaw",
+    "xmpp",
+    "plugin",
+    "channel",
+    "chatbot"
+  ],
+  "main": "./dist/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist/",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "setupEntry": "./dist/setup-entry.js",
+    "channel": {
+      "id": "xmpp",
+      "label": "XMPP",
+      "selectionLabel": "XMPP (bot/JID)",
+      "docsLabel": "xmpp",
+      "blurb": "Connect OpenClaw to an XMPP server or MUC as a bot account.",
+      "order": 96
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "node build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "@privacyresearch/libsignal-protocol-typescript": "^0.0.16",
+    "@xmpp/client": "^0.14.0"
+  }
+}
