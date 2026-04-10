@@ -204,12 +204,12 @@ interface XmppOmemoDecryptedHeader {
   isPreKey: boolean;
 }
 
-const NS_OMEMO = "eu.siacs.conversations.axolotl";
+export const NS_OMEMO = "urn:xmpp:omemo:2";
 const NS_PUBSUB = "http://jabber.org/protocol/pubsub";
 const NS_HINTS = "urn:xmpp:hints";
 const NS_EME = "urn:xmpp:eme:0";
-const OMEMO_DEVICELIST_NODE = "eu.siacs.conversations.axolotl.devicelist";
-const OMEMO_BUNDLES_PREFIX = "eu.siacs.conversations.axolotl.bundles:";
+export const OMEMO_DEVICELIST_NODE = "urn:xmpp:omemo:2:devices";
+export const OMEMO_BUNDLES_NODE = "urn:xmpp:omemo:2:bundles";
 const DEVICE_LIST_CACHE_TTL_MS = 10 * 60_000;
 const BUNDLE_CACHE_TTL_MS = 10 * 60_000;
 const MAX_POLICY_VIOLATIONS = 16;
@@ -325,13 +325,76 @@ function randomBytes(size: number): ArrayBuffer {
   return bytes.buffer;
 }
 
-function omemoBundleNode(deviceId: number): string {
-  return `${OMEMO_BUNDLES_PREFIX}${deviceId}`;
-}
-
 function isXmppItemNotFoundError(error: unknown): boolean {
   const message = String(error).toLowerCase();
   return message.includes("item-not-found");
+}
+
+function buildPubsubPublishOptions(fields: Record<string, string>): XmppElement {
+  return xml(
+    "publish-options",
+    {},
+    xml(
+      "x",
+      { xmlns: "jabber:x:data", type: "submit" },
+      xml(
+        "field",
+        { var: "FORM_TYPE", type: "hidden" },
+        xml("value", {}, "http://jabber.org/protocol/pubsub#publish-options")
+      ),
+      ...Object.entries(fields).map(([name, value]) =>
+        xml("field", { var: name }, xml("value", {}, value))
+      )
+    )
+  );
+}
+
+export function buildOmemoDeviceListItem(deviceIds: number[]): XmppElement {
+  return xml(
+    "item",
+    { id: "current" },
+    xml(
+      "devices",
+      { xmlns: NS_OMEMO },
+      ...deviceIds.map((deviceId) => xml("device", { id: String(deviceId) }))
+    )
+  );
+}
+
+export function buildOmemoBundleItem(
+  deviceId: number,
+  activeSignedPreKey: SerializedSignedPreKey,
+  preKeyEntries: Array<{ keyId: number; pair: SerializedKeyPair }>,
+  identityKey: SerializedKeyPair
+): XmppElement {
+  return xml(
+    "item",
+    { id: String(deviceId) },
+    xml(
+      "bundle",
+      { xmlns: NS_OMEMO },
+      xml("spk", { id: String(activeSignedPreKey.keyId) }, activeSignedPreKey.pubKey),
+      xml("spks", {}, activeSignedPreKey.signature),
+      xml("ik", {}, identityKey.pubKey),
+      xml(
+        "prekeys",
+        {},
+        ...preKeyEntries.map(({ keyId, pair }) => xml("pk", { id: String(keyId) }, pair.pubKey))
+      )
+    )
+  );
+}
+
+function buildOmemoKeysElement(jid: string, keyElements: XmppElement[]): XmppElement {
+  return xml("keys", { jid }, ...keyElements);
+}
+
+function findChildByName(element: XmppElement | null | undefined, names: string[], xmlns?: string): XmppElement | null {
+  for (const name of names) {
+    const child = element?.getChild(name, xmlns) ?? element?.getChild(name);
+    if (child) return child;
+  }
+  return null;
 }
 
 function generateOmemoDeviceId(): number {
@@ -418,13 +481,13 @@ function extractOmemoEncryptedSnapshot(stanza: XmppElement): XmppOmemoEncryptedI
   };
 }
 
-function extractDeviceList(items: XmppElement | null): number[] {
+export function extractDeviceList(items: XmppElement | null): number[] {
   const item = items?.getChild("item") ?? null;
   const list =
-    item?.getChild("list", NS_OMEMO) ??
-    items?.getChild("list", NS_OMEMO) ??
-    item?.getChild("list") ??
-    items?.getChild("list");
+    findChildByName(item, ["devices", "list"], NS_OMEMO) ??
+    findChildByName(items, ["devices", "list"], NS_OMEMO) ??
+    findChildByName(item, ["devices", "list"]) ??
+    findChildByName(items, ["devices", "list"]);
   return uniqueSortedNumbers(
     elementChildren(list, "device")
       .map((device) => parseNumericAttr(device.attrs.id))
@@ -432,7 +495,7 @@ function extractDeviceList(items: XmppElement | null): number[] {
   );
 }
 
-function parseBundle(items: XmppElement | null): {
+export function parseBundle(items: XmppElement | null): {
   identityKey: ArrayBuffer;
   signedPreKey: { keyId: number; publicKey: ArrayBuffer; signature: ArrayBuffer };
   preKeys: Array<{ keyId: number; publicKey: ArrayBuffer }>;
@@ -441,25 +504,28 @@ function parseBundle(items: XmppElement | null): {
   const bundle = item?.getChild("bundle", NS_OMEMO) ?? items?.getChild("bundle", NS_OMEMO);
   if (!bundle) return null;
 
-  const identityKeyText = bundle.getChildText("identityKey", NS_OMEMO) ?? bundle.getChildText("identityKey");
+  const identityKeyText = bundle.getChildText("ik", NS_OMEMO) ?? bundle.getChildText("identityKey", NS_OMEMO) ?? bundle.getChildText("ik") ?? bundle.getChildText("identityKey");
   const signedPreKeyEl =
-    bundle.getChild("signedPreKeyPublic", NS_OMEMO) ?? bundle.getChild("signedPreKeyPublic");
+    bundle.getChild("spk", NS_OMEMO) ??
+    bundle.getChild("signedPreKeyPublic", NS_OMEMO) ??
+    bundle.getChild("spk") ??
+    bundle.getChild("signedPreKeyPublic");
   const signatureText =
+    bundle.getChildText("spks", NS_OMEMO) ??
     bundle.getChildText("signedPreKeySignature", NS_OMEMO) ??
+    bundle.getChildText("spks") ??
     bundle.getChildText("signedPreKeySignature");
   const prekeysEl = bundle.getChild("prekeys", NS_OMEMO) ?? bundle.getChild("prekeys");
 
-  const signedPreKeyId = parseNumericAttr(
-    signedPreKeyEl?.attrs.signedPreKeyId ?? signedPreKeyEl?.attrs.id
-  );
+  const signedPreKeyId = parseNumericAttr(signedPreKeyEl?.attrs.id ?? signedPreKeyEl?.attrs.signedPreKeyId);
 
   if (!identityKeyText || !signedPreKeyEl?.text?.() || !signatureText || !signedPreKeyId) {
     return null;
   }
 
-  const preKeys = elementChildren(prekeysEl, "preKeyPublic")
+  const preKeys = [...elementChildren(prekeysEl, "pk"), ...elementChildren(prekeysEl, "preKeyPublic")]
     .map((preKeyEl) => {
-      const keyId = parseNumericAttr(preKeyEl.attrs.preKeyId ?? preKeyEl.attrs.id);
+      const keyId = parseNumericAttr(preKeyEl.attrs.id ?? preKeyEl.attrs.preKeyId);
       const value = preKeyEl.text?.() ?? "";
       if (!keyId || !value) return null;
       return {
@@ -957,7 +1023,7 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     }
 
     try {
-      const items = await this.fetchPubsubItems(to, omemoBundleNode(deviceId));
+      const items = await this.fetchPubsubItems(to, OMEMO_BUNDLES_NODE, String(deviceId));
       if (!items) {
         throw new Error("xmpp iqCaller unavailable");
       }
@@ -979,7 +1045,6 @@ class DefaultXmppOmemoController implements XmppOmemoController {
           identityKey: parsed.identityKey,
           signedPreKey: parsed.signedPreKey,
           preKey: selectedPreKey,
-          registrationId: deviceId,
         },
       };
 
@@ -1028,7 +1093,7 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     deviceId: number,
     _snapshot: XmppOmemoBundleSnapshot
   ): Promise<XmppOmemoBundleResult> {
-    const items = await this.fetchPubsubItems(to, omemoBundleNode(deviceId));
+    const items = await this.fetchPubsubItems(to, OMEMO_BUNDLES_NODE, String(deviceId));
     if (!items) {
       return { fetchedAt: nowIso(), fetchError: "xmpp iqCaller unavailable" };
     }
@@ -1049,7 +1114,6 @@ class DefaultXmppOmemoController implements XmppOmemoController {
         identityKey: parsed.identityKey,
         signedPreKey: parsed.signedPreKey,
         preKey: selectedPreKey,
-        registrationId: deviceId,
       },
     };
   }
@@ -1231,18 +1295,9 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     const ownBareJid = normalizeContactJid(this.account.jid);
     const current = await this.refreshRecipientDeviceList(ownBareJid);
     const deviceIds = uniqueSortedNumbers([...current.deviceIds, this.state.signal.deviceId]);
-    await this.publishPubsubNode(
-      OMEMO_DEVICELIST_NODE,
-      xml(
-        "item",
-        { id: "current" },
-        xml(
-          "list",
-          { xmlns: NS_OMEMO },
-          ...deviceIds.map((deviceId) => xml("device", { id: String(deviceId) }))
-        )
-      )
-    );
+    await this.publishPubsubNode(OMEMO_DEVICELIST_NODE, buildOmemoDeviceListItem(deviceIds), {
+      "pubsub#access_model": "open",
+    });
     const contact = this.ensureContact(ownBareJid);
     contact.deviceList = { fetchedAt: nowIso(), deviceIds };
     await this.persistState();
@@ -1259,37 +1314,33 @@ class DefaultXmppOmemoController implements XmppOmemoController {
       .sort((a, b) => a.keyId - b.keyId);
 
     await this.publishPubsubNode(
-      omemoBundleNode(this.state.signal.deviceId),
-      xml(
-        "item",
-        { id: "current" },
-        xml(
-          "bundle",
-          { xmlns: NS_OMEMO },
-          xml(
-            "signedPreKeyPublic",
-            { signedPreKeyId: String(activeSignedPreKey.keyId), id: String(activeSignedPreKey.keyId) },
-            activeSignedPreKey.pubKey
-          ),
-          xml("signedPreKeySignature", {}, activeSignedPreKey.signature),
-          xml("identityKey", {}, this.state.signal.identityKeyPair.pubKey),
-          xml(
-            "prekeys",
-            {},
-            ...preKeyEntries.map(({ keyId, pair }) =>
-              xml("preKeyPublic", { preKeyId: String(keyId), id: String(keyId) }, pair.pubKey)
-            )
-          )
-        )
-      )
+      OMEMO_BUNDLES_NODE,
+      buildOmemoBundleItem(
+        this.state.signal.deviceId,
+        activeSignedPreKey,
+        preKeyEntries,
+        this.state.signal.identityKeyPair
+      ),
+      {
+        "pubsub#access_model": "open",
+        "pubsub#max_items": "max",
+      }
     );
 
     this.state.signal.lastBundlePublishedAt = nowIso();
     await this.persistState();
   }
 
-  private async fetchPubsubItems(to: string | undefined, node: string): Promise<XmppElement | null> {
-    const query = xml("pubsub", { xmlns: NS_PUBSUB }, xml("items", { node }));
+  private async fetchPubsubItems(
+    to: string | undefined,
+    node: string,
+    itemId?: string
+  ): Promise<XmppElement | null> {
+    const query = xml(
+      "pubsub",
+      { xmlns: NS_PUBSUB },
+      xml("items", { node }, ...(itemId ? [xml("item", { id: itemId })] : []))
+    );
     const iqCaller = this.client.iqCaller;
     if (iqCaller?.get) {
       return await iqCaller.get(query, to, 10_000);
@@ -1303,8 +1354,17 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     return null;
   }
 
-  private async publishPubsubNode(node: string, item: XmppElement): Promise<void> {
-    const stanza = xml("pubsub", { xmlns: NS_PUBSUB }, xml("publish", { node }, item));
+  private async publishPubsubNode(
+    node: string,
+    item: XmppElement,
+    publishOptions?: Record<string, string>
+  ): Promise<void> {
+    const stanza = xml(
+      "pubsub",
+      { xmlns: NS_PUBSUB },
+      xml("publish", { node }, item),
+      ...(publishOptions ? [buildPubsubPublishOptions(publishOptions)] : [])
+    );
     const iqCaller = this.client.iqCaller;
     if (iqCaller?.set) {
       await iqCaller.set(stanza, undefined, 10_000);
