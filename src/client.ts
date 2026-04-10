@@ -19,6 +19,7 @@ export interface XmppTransportLifecycle {
 interface StartXmppTransportParams {
   account: XmppTransportAccount;
   abortSignal?: AbortSignal;
+  createClient?: typeof createXmppClient;
   log?: {
     info?: (message: string) => void;
     warn?: (message: string) => void;
@@ -60,7 +61,7 @@ function summarizeStanza(stanza: {
 export async function startXmppTransport(
   params: StartXmppTransportParams
 ): Promise<XmppTransportLifecycle> {
-  const { account, abortSignal, log, setStatus } = params;
+  const { account, abortSignal, createClient = createXmppClient, log, setStatus } = params;
   const parsed = parseXmppJid(account.jid);
   if (!parsed) {
     throw new Error(`Invalid XMPP JID: ${account.jid}`);
@@ -70,7 +71,7 @@ export async function startXmppTransport(
   const resolvedDomain = account.chatDomain?.trim() || domain;
   const resolvedResource = parsed.resource || "openclaw";
 
-  const xmpp = createXmppClient({
+  const xmpp = createClient({
     service: account.service,
     domain: resolvedDomain,
     resource: resolvedResource,
@@ -87,6 +88,9 @@ export async function startXmppTransport(
   const done = new Promise<void>((resolve, reject) => {
     resolveDone = resolve;
     rejectDone = reject;
+  });
+  done.catch(() => {
+    // Prevent unhandled-rejection noise before callers attach their own handlers.
   });
 
   const updateStatus = (extra: Record<string, unknown>) => {
