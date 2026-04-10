@@ -1,5 +1,6 @@
 import { client as createXmppClient, xml, type XmppClient } from "@xmpp/client";
 
+import { buildCapsElement } from "./disco.js";
 import { parseXmppJid } from "./ids.js";
 
 export interface XmppTransportAccount {
@@ -129,7 +130,7 @@ export async function startXmppTransport(
     });
 
     try {
-      await xmpp.send(xml("presence"));
+      await xmpp.send(xml("presence", {}, buildCapsElement()));
     } catch (error) {
       log?.warn?.(
         `[${account.accountId}] failed to send initial presence: ${String(error)}`

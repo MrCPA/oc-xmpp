@@ -9,6 +9,7 @@ import {
 import { dispatchInboundReplyWithBase } from "openclaw/plugin-sdk/inbound-reply-dispatch";
 import type { PluginRuntime, OpenClawConfig } from "openclaw/plugin-sdk/core";
 
+import { buildDiscoInfoResult, NS_DISCO_INFO, supportsDiscoInfoNode } from "./disco.js";
 import { parseXmppJid, normalizeXmppBareJid } from "./ids.js";
 import {
   createXmppMessageKey,
@@ -428,6 +429,19 @@ export async function startXmppInboundLoop(
   };
 
   const onStanza = (stanza: XmppElement) => {
+    if (stanza.is("iq") && String(stanza.attrs.type ?? "").toLowerCase() === "get") {
+      const query = stanza.getChild("query", NS_DISCO_INFO) ?? stanza.getChild("query");
+      const from = String(stanza.attrs.from ?? "").trim();
+      const id = String(stanza.attrs.id ?? "").trim();
+      const node = typeof query?.attrs.node === "string" ? query.attrs.node : undefined;
+      if (query && from && id && supportsDiscoInfoNode(node)) {
+        void client.send(
+          xml("iq", { to: from, id, type: "result" }, buildDiscoInfoResult(node))
+        );
+      }
+      return;
+    }
+
     if (!stanza.is("message")) return;
 
     const from = parseXmppJid(stanza.attrs.from ?? "");
