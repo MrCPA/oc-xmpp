@@ -122,20 +122,24 @@ export async function startXmppTransport(
     updateStatus({ transportState: status });
   });
 
-  xmpp.on("online", async (address: { toString(): string }) => {
-    log?.info?.(`[${account.accountId}] XMPP online as ${address.toString()}`);
-    updateStatus({
-      connectedJid: address.toString(),
-      transportState: "online",
-    });
+  xmpp.on("online", (address: { toString(): string }) => {
+    void (async () => {
+      log?.info?.(`[${account.accountId}] XMPP online as ${address.toString()}`);
+      updateStatus({
+        connectedJid: address.toString(),
+        transportState: "online",
+      });
 
-    try {
-      await xmpp.send(xml("presence", {}, buildCapsElement()));
-    } catch (error) {
-      log?.warn?.(
-        `[${account.accountId}] failed to send initial presence: ${String(error)}`
-      );
-    }
+      try {
+        await xmpp.send(xml("presence", {}, buildCapsElement()));
+      } catch (error) {
+        log?.warn?.(
+          `[${account.accountId}] failed to send initial presence: ${String(error)}`
+        );
+      }
+    })().catch((error) => {
+      log?.error?.(`[${account.accountId}] XMPP online handler failed: ${String(error)}`);
+    });
   });
 
   xmpp.on("offline", () => {
