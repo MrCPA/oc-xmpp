@@ -720,6 +720,10 @@ class DefaultXmppOmemoController implements XmppOmemoController {
   private readonly setStatus?: XmppOmemoStatusSink;
   private state: XmppOmemoState;
   private readonly signalStore: JsonSignalStorage;
+  private opQueue: Promise<void> = Promise.resolve();
+  private persistQueue: Promise<void> = Promise.resolve();
+  private maintenanceScheduled = false;
+  private stopped = false;
 
   constructor(params: CreateXmppOmemoControllerParams) {
     this.account = params.account;
@@ -737,14 +741,16 @@ class DefaultXmppOmemoController implements XmppOmemoController {
   }
 
   async initialize(): Promise<void> {
-    this.state = await this.loadState();
-    await this.ensureLocalKeys();
-    await this.ensureEnoughPreKeys();
-    if (this.config.mode !== "off") {
-      await this.publishOwnDeviceListAndBundle();
-    }
-    await this.persistState();
-    this.publishStatus();
+    await this.runExclusive(async () => {
+      this.state = await this.loadState();
+      await this.ensureLocalKeys();
+      await this.ensureEnoughPreKeys();
+      if (this.config.mode !== "off") {
+        await this.publishOwnDeviceListAndBundle();
+      }
+      await this.persistState();
+      this.publishStatus();
+    });
   }
 
   async beforeSend(params: {
@@ -757,44 +763,46 @@ class DefaultXmppOmemoController implements XmppOmemoController {
       return null;
     }
 
-    const to = normalizeContactJid(params.to);
-    const contact = this.ensureContact(to);
+    return await this.runExclusive(async () => {
+      const to = normalizeContactJid(params.to);
+      const contact = this.ensureContact(to);
 
-    if (this.config.mode === "off") {
-      contact.lastPlaintextOutboundAt = nowIso();
-      await this.persistState();
-      return null;
-    }
-
-    try {
-      const stanza = await this.buildEncryptedMessage(params.messageId, to, params.text);
-      contact.lastEncryptedOutboundAt = nowIso();
-      this.state.interoperability.lastSuccessfulEncryptionAt = contact.lastEncryptedOutboundAt;
-      this.state.interoperability.lastWarning = undefined;
-      await this.persistState();
-      this.publishStatus({ omemoFallback: undefined, omemoLastEncryptedTo: to });
-      return stanza;
-    } catch (error) {
-      const message = String(error);
-      if (this.config.mode === "required") {
-        this.recordPolicyViolation(contact, "outbound", message);
+      if (this.config.mode === "off") {
+        contact.lastPlaintextOutboundAt = nowIso();
         await this.persistState();
-        throw new Error(`XMPP OMEMO required for ${to}, but ${message}`);
+        return null;
       }
 
-      if (!this.config.allowUnencryptedFallback) {
-        this.recordPolicyViolation(contact, "outbound", message);
+      try {
+        const stanza = await this.buildEncryptedMessage(params.messageId, to, params.text);
+        contact.lastEncryptedOutboundAt = nowIso();
+        this.state.interoperability.lastSuccessfulEncryptionAt = contact.lastEncryptedOutboundAt;
+        this.state.interoperability.lastWarning = undefined;
         await this.persistState();
-        throw new Error(`XMPP OMEMO is enabled for ${to}, but ${message}`);
-      }
+        this.publishStatus({ omemoFallback: undefined, omemoLastEncryptedTo: to });
+        return stanza;
+      } catch (error) {
+        const message = String(error);
+        if (this.config.mode === "required") {
+          this.recordPolicyViolation(contact, "outbound", message);
+          await this.persistState();
+          throw new Error(`XMPP OMEMO required for ${to}, but ${message}`);
+        }
 
-      contact.lastPlaintextOutboundAt = nowIso();
-      this.state.interoperability.lastWarning = `falling back to plaintext for ${to}: ${message}`;
-      this.log?.warn?.(`[${this.account.accountId}] ${this.state.interoperability.lastWarning}`);
-      await this.persistState();
-      this.publishStatus({ omemoFallback: "plaintext" });
-      return null;
-    }
+        if (!this.config.allowUnencryptedFallback) {
+          this.recordPolicyViolation(contact, "outbound", message);
+          await this.persistState();
+          throw new Error(`XMPP OMEMO is enabled for ${to}, but ${message}`);
+        }
+
+        contact.lastPlaintextOutboundAt = nowIso();
+        this.state.interoperability.lastWarning = `falling back to plaintext for ${to}: ${message}`;
+        this.log?.warn?.(`[${this.account.accountId}] ${this.state.interoperability.lastWarning}`);
+        await this.persistState();
+        this.publishStatus({ omemoFallback: "plaintext" });
+        return null;
+      }
+    });
   }
 
   async afterPlaintextSend(params: {
@@ -803,9 +811,11 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     text: string;
   }): Promise<void> {
     if (params.chatType !== "direct") return;
-    const contact = this.ensureContact(normalizeContactJid(params.to));
-    contact.lastPlaintextOutboundAt = nowIso();
-    await this.persistState();
+    await this.runExclusive(async () => {
+      const contact = this.ensureContact(normalizeContactJid(params.to));
+      contact.lastPlaintextOutboundAt = nowIso();
+      await this.persistState();
+    });
   }
 
   async handleInboundEncryptedDm(params: {
@@ -813,50 +823,51 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     stanza: XmppElement;
     reply?: (text: string) => Promise<void>;
   }): Promise<XmppOmemoEncryptedReceiveResult> {
-    const snapshot = extractOmemoEncryptedSnapshot(params.stanza);
-    if (!snapshot) {
-      return { handled: false };
-    }
-
-    const from = normalizeContactJid(params.from);
-    const contact = this.ensureContact(from);
-    contact.lastEncryptedInboundAt = nowIso();
-    contact.lastEncryptedInbound = snapshot;
-
-    try {
-      const decrypted = await this.decryptInboundMessage(from, params.stanza);
-      snapshot.decrypted = true;
-      contact.lastEncryptedInbound = snapshot;
-      this.state.interoperability.lastSuccessfulDecryptionAt = contact.lastEncryptedInboundAt;
-      this.state.interoperability.lastWarning = undefined;
-      await this.ensureEnoughPreKeys();
-      await this.publishOwnDeviceListAndBundle();
-      await this.persistState();
-      this.publishStatus({
-        omemoLastEncryptedFrom: from,
-        omemoLastEncryptedAt: contact.lastEncryptedInboundAt,
-        omemoEncryptedInboundUnsupported: false,
-      });
-      return { handled: true, body: decrypted };
-    } catch (error) {
-      const message = String(error);
-      this.state.interoperability.lastWarning = `received OMEMO payload from ${from}, but decryption failed: ${message}`;
-      await this.persistState();
-      this.publishStatus({
-        omemoLastEncryptedFrom: from,
-        omemoLastEncryptedAt: contact.lastEncryptedInboundAt,
-        omemoEncryptedInboundUnsupported: true,
-      });
-      this.log?.warn?.(`[${this.account.accountId}] failed decrypting OMEMO XMPP DM from ${from}: ${message}`);
-
-      if (this.config.replyOnUnsupportedInbound && params.reply) {
-        await params.reply(
-          "I received an OMEMO-encrypted XMPP message, but I could not decrypt it. Please resend or let me refresh the session."
-        );
+    return await this.runExclusive(async () => {
+      const snapshot = extractOmemoEncryptedSnapshot(params.stanza);
+      if (!snapshot) {
+        return { handled: false };
       }
 
-      return { handled: true };
-    }
+      const from = normalizeContactJid(params.from);
+      const contact = this.ensureContact(from);
+      contact.lastEncryptedInboundAt = nowIso();
+      contact.lastEncryptedInbound = snapshot;
+
+      try {
+        const decrypted = await this.decryptInboundMessage(from, params.stanza);
+        snapshot.decrypted = true;
+        contact.lastEncryptedInbound = snapshot;
+        this.state.interoperability.lastSuccessfulDecryptionAt = contact.lastEncryptedInboundAt;
+        this.state.interoperability.lastWarning = undefined;
+        await this.persistState();
+        this.scheduleMaintenance();
+        this.publishStatus({
+          omemoLastEncryptedFrom: from,
+          omemoLastEncryptedAt: contact.lastEncryptedInboundAt,
+          omemoEncryptedInboundUnsupported: false,
+        });
+        return { handled: true, body: decrypted };
+      } catch (error) {
+        const message = String(error);
+        this.state.interoperability.lastWarning = `received OMEMO payload from ${from}, but decryption failed: ${message}`;
+        await this.persistState();
+        this.publishStatus({
+          omemoLastEncryptedFrom: from,
+          omemoLastEncryptedAt: contact.lastEncryptedInboundAt,
+          omemoEncryptedInboundUnsupported: true,
+        });
+        this.log?.warn?.(`[${this.account.accountId}] failed decrypting OMEMO XMPP DM from ${from}: ${message}`);
+
+        if (this.config.replyOnUnsupportedInbound && params.reply) {
+          await params.reply(
+            "I received an OMEMO-encrypted XMPP message, but I could not decrypt it. Please resend or let me refresh the session."
+          );
+        }
+
+        return { handled: true };
+      }
+    });
   }
 
   async allowInboundPlaintextDm(params: {
@@ -864,31 +875,36 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     body: string;
     reply?: (text: string) => Promise<void>;
   }): Promise<boolean> {
-    const from = normalizeContactJid(params.from);
-    const contact = this.ensureContact(from);
-    contact.lastPlaintextInboundAt = nowIso();
+    return await this.runExclusive(async () => {
+      const from = normalizeContactJid(params.from);
+      const contact = this.ensureContact(from);
+      contact.lastPlaintextInboundAt = nowIso();
 
-    if (this.config.mode !== "required") {
+      if (this.config.mode !== "required") {
+        await this.persistState();
+        return true;
+      }
+
+      const reason = "plaintext inbound DM rejected because OMEMO is required";
+      this.recordPolicyViolation(contact, "inbound", reason);
+      this.state.interoperability.lastWarning = reason;
       await this.persistState();
-      return true;
-    }
+      this.publishStatus({ omemoLastRejectedPlaintextFrom: from });
+      this.log?.warn?.(`[${this.account.accountId}] rejected plaintext XMPP DM from ${from} because OMEMO is required`);
 
-    const reason = "plaintext inbound DM rejected because OMEMO is required";
-    this.recordPolicyViolation(contact, "inbound", reason);
-    this.state.interoperability.lastWarning = reason;
-    await this.persistState();
-    this.publishStatus({ omemoLastRejectedPlaintextFrom: from });
-    this.log?.warn?.(`[${this.account.accountId}] rejected plaintext XMPP DM from ${from} because OMEMO is required`);
+      if (this.config.replyOnUnsupportedInbound && params.reply) {
+        await params.reply("Plaintext XMPP direct messages are disabled here because OMEMO is required.");
+      }
 
-    if (this.config.replyOnUnsupportedInbound && params.reply) {
-      await params.reply("Plaintext XMPP direct messages are disabled here because OMEMO is required.");
-    }
-
-    return false;
+      return false;
+    });
   }
 
   async stop(): Promise<void> {
-    await this.persistState();
+    this.stopped = true;
+    await this.runExclusive(async () => {
+      await this.persistState();
+    });
   }
 
   private async ensureLocalKeys(): Promise<void> {
@@ -972,10 +988,53 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     }
   }
 
+  private async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const previous = this.opQueue;
+    this.opQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private scheduleMaintenance(): void {
+    if (this.maintenanceScheduled || this.stopped || this.config.mode === "off") {
+      return;
+    }
+    this.maintenanceScheduled = true;
+    queueMicrotask(() => {
+      void this.runExclusive(async () => {
+        this.maintenanceScheduled = false;
+        if (this.stopped || this.config.mode === "off") {
+          return;
+        }
+        await this.ensureEnoughPreKeys();
+        await this.publishOwnDeviceListAndBundle();
+        await this.persistState();
+      }).catch((error) => {
+        this.maintenanceScheduled = false;
+        this.log?.warn?.(
+          `[${this.account.accountId}] OMEMO maintenance failed: ${String(error)}`
+        );
+      });
+    });
+  }
+
   private async persistState(): Promise<void> {
     this.state.updatedAt = nowIso();
-    await mkdir(path.dirname(this.statePath), { recursive: true });
-    await writeFile(this.statePath, JSON.stringify(this.state, null, 2) + "\n", "utf8");
+    const snapshot = JSON.stringify(this.state, null, 2) + "\n";
+    this.persistQueue = this.persistQueue
+      .catch(() => {})
+      .then(async () => {
+        await mkdir(path.dirname(this.statePath), { recursive: true });
+        await writeFile(this.statePath, snapshot, "utf8");
+      });
+    await this.persistQueue;
   }
 
   private ensureContact(raw: string): XmppOmemoContactState {
@@ -1236,7 +1295,9 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     }
 
     if (errors.length > 0) {
-      throw new Error(`failed encrypting for all recipient devices (${errors.join("; ")})`);
+      this.log?.warn?.(
+        `[${this.account.accountId}] partial OMEMO encryption for ${recipientBareJid}: ${errors.join("; ")}`
+      );
     }
 
     return xml(

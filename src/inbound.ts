@@ -129,6 +129,8 @@ export async function startXmppInboundLoop(
   const iqCallee = (client as XmppClient & {
     iqCallee?: { get?: (xmlns: string, name: string, handler: (query: XmppElement) => XmppElement | boolean) => void };
   }).iqCallee;
+  const inFlight = new Set<Promise<void>>();
+  let stopping = false;
   const pairing = createChannelPairingController({
     core: runtime,
     channel: "xmpp",
@@ -432,6 +434,7 @@ export async function startXmppInboundLoop(
   };
 
   const onStanza = (stanza: XmppElement) => {
+    if (stopping) return;
     if (!stanza.is("message")) return;
 
     const from = parseXmppJid(stanza.attrs.from ?? "");
@@ -448,7 +451,7 @@ export async function startXmppInboundLoop(
     }
 
     const type = (stanza.attrs.type ?? "chat").toLowerCase();
-    void (async () => {
+    const task = (async () => {
       try {
         if (type === "groupchat") {
           await handleRoomMessage(stanza);
@@ -463,7 +466,10 @@ export async function startXmppInboundLoop(
           `[${ctx.account.accountId}] XMPP inbound handling failed: ${String(error)}`
         );
       }
-    })();
+    })().finally(() => {
+      inFlight.delete(task);
+    });
+    inFlight.add(task);
   };
 
   const onOnline = () => {
@@ -491,8 +497,12 @@ export async function startXmppInboundLoop(
 
   return {
     stop: async () => {
+      stopping = true;
       client.removeListener("stanza", onStanza);
       client.removeListener("online", onOnline);
+      if (inFlight.size > 0) {
+        await Promise.allSettled([...inFlight]);
+      }
     },
   };
 }
