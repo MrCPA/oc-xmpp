@@ -126,6 +126,9 @@ export async function startXmppInboundLoop(
 
   const botNick = resolveMucNick(ctx.account);
   const seenMessageIds = createSeenMessageTracker();
+  const iqCallee = (client as XmppClient & {
+    iqCallee?: { get?: (xmlns: string, name: string, handler: (query: XmppElement) => XmppElement | boolean) => void };
+  }).iqCallee;
   const pairing = createChannelPairingController({
     core: runtime,
     channel: "xmpp",
@@ -429,19 +432,6 @@ export async function startXmppInboundLoop(
   };
 
   const onStanza = (stanza: XmppElement) => {
-    if (stanza.is("iq") && String(stanza.attrs.type ?? "").toLowerCase() === "get") {
-      const query = stanza.getChild("query", NS_DISCO_INFO) ?? stanza.getChild("query");
-      const from = String(stanza.attrs.from ?? "").trim();
-      const id = String(stanza.attrs.id ?? "").trim();
-      const node = typeof query?.attrs.node === "string" ? query.attrs.node : undefined;
-      if (query && from && id && supportsDiscoInfoNode(node)) {
-        void client.send(
-          xml("iq", { to: from, id, type: "result" }, buildDiscoInfoResult(node))
-        );
-      }
-      return;
-    }
-
     if (!stanza.is("message")) return;
 
     const from = parseXmppJid(stanza.attrs.from ?? "");
@@ -484,6 +474,11 @@ export async function startXmppInboundLoop(
       setStatus: ctx.setStatus,
     });
   };
+
+  iqCallee?.get?.(NS_DISCO_INFO, "query", (query: XmppElement) => {
+    const node = typeof query?.attrs.node === "string" ? query.attrs.node : undefined;
+    return supportsDiscoInfoNode(node) ? buildDiscoInfoResult(node) : false;
+  });
 
   client.on("stanza", onStanza);
   client.on("online", onOnline);
