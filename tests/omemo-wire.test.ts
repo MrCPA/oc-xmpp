@@ -9,6 +9,8 @@ import {
   OMEMO_DEVICELIST_NODE,
   buildOmemoBundleItem,
   buildOmemoDeviceListItem,
+  buildOmemoSceEnvelope,
+  extractBodyFromSceEnvelopeString,
   extractDeviceList,
   parseBundle,
 } from "../src/omemo.ts";
@@ -47,6 +49,11 @@ test("extractDeviceList reads omemo:2 devices payload", () => {
   );
 
   assert.deepEqual(extractDeviceList(items), [3, 9]);
+});
+
+test("buildOmemoSceEnvelope and extractBodyFromSceEnvelopeString round-trip body text", () => {
+  const envelope = buildOmemoSceEnvelope("Hello modern OMEMO", "marks-agent@talk.ruzicka.us");
+  assert.equal(extractBodyFromSceEnvelopeString(envelope.toString()), "Hello modern OMEMO");
 });
 
 test("buildOmemoBundleItem and parseBundle round-trip modern omemo:2 bundle shape", () => {

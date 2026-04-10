@@ -50,16 +50,20 @@ The code was passing `registrationId: deviceId` into the Signal prekey device ob
 - added modern device/bundle builders for OMEMO:2 payload shapes
 - added modern parse support for OMEMO:2 payloads while keeping legacy read compatibility where practical
 - added publish-options support so nodes can be published with explicit access settings
-- started moving bundle fetches to the shared OMEMO:2 bundles node
-- added focused tests for modern device-list and bundle wire shapes
+- moved bundle fetches/publication to the shared OMEMO:2 bundles node with device-id item ids
+- migrated direct-message payload crypto toward the OMEMO:2 payload model:
+  - SCE envelope generation
+  - AES-256-CBC payload encryption
+  - truncated HMAC-SHA-256 payload authentication
+  - OMEMO:2 grouped `<keys jid='...'>` header parsing and emission
+- added focused tests for modern device-list, bundle, and SCE envelope wire shapes
 
 ## Remaining work
 
-1. Finish the shared-bundles fetch/publish migration end-to-end.
-2. Migrate message transport from the legacy flat-header format to OMEMO:2 header semantics.
-3. Confirm the payload/envelope matches the XEP-0384 SCE profile.
-4. Add tests for modern encrypted message encode/decode structure.
-5. Revalidate against the live Prosody host and a real client round-trip.
+1. Add tests for modern encrypted message encode/decode structure end-to-end.
+2. Consider multi-device self-encryption for the sender's other devices to match the OMEMO:2 recommendation more fully.
+3. Revalidate against the live Prosody host and a real client round-trip.
+4. Check whether additional disco/notification advertisement is needed for best client interoperability.
 
 ## Recommendation
 

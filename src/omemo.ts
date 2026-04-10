@@ -1,8 +1,9 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { createHash, randomInt, randomUUID, webcrypto } from "node:crypto";
+import { createHash, randomInt, randomUUID, timingSafeEqual, webcrypto } from "node:crypto";
 
 import { xml, type XmppClient, type XmppElement } from "@xmpp/client";
+import parseXml from "@xmpp/xml/lib/parse.js";
 import {
   Direction as SignalDirection,
   KeyHelper,
@@ -193,7 +194,6 @@ interface XmppOmemoPayloadMaterial {
   key: ArrayBuffer;
   tag: ArrayBuffer;
   keyAndTag: ArrayBuffer;
-  iv: string;
   payload: string;
 }
 
@@ -210,15 +210,18 @@ const NS_HINTS = "urn:xmpp:hints";
 const NS_EME = "urn:xmpp:eme:0";
 export const OMEMO_DEVICELIST_NODE = "urn:xmpp:omemo:2:devices";
 export const OMEMO_BUNDLES_NODE = "urn:xmpp:omemo:2:bundles";
+const NS_SCE = "urn:xmpp:sce:1";
+const NS_JABBER_CLIENT = "jabber:client";
 const DEVICE_LIST_CACHE_TTL_MS = 10 * 60_000;
 const BUNDLE_CACHE_TTL_MS = 10 * 60_000;
 const MAX_POLICY_VIOLATIONS = 16;
 const PREKEY_LOW_WATERMARK = 25;
 const PREKEY_TARGET_COUNT = 100;
-const AES_GCM_KEY_LENGTH = 128;
-const AES_GCM_TAG_LENGTH = 128;
-const AES_GCM_IV_BYTES = 12;
-const KEY_BYTES = 16;
+const AES_PAYLOAD_KEY_LENGTH = 256;
+const PAYLOAD_KEY_BYTES = 32;
+const PAYLOAD_HMAC_BYTES = 16;
+const HKDF_BYTES = 80;
+const HKDF_INFO_PAYLOAD = "OMEMO Payload";
 const TAG_BYTES = 16;
 
 function sanitizePathSegment(value: string): string {
@@ -323,6 +326,67 @@ function randomBytes(size: number): ArrayBuffer {
   const bytes = new Uint8Array(size);
   webcrypto.getRandomValues(bytes);
   return bytes.buffer;
+}
+
+async function hkdfSha256(input: ArrayBuffer, info: string, bytes: number): Promise<ArrayBuffer> {
+  const key = await webcrypto.subtle.importKey("raw", input, "HKDF", false, ["deriveBits"]);
+  const bits = await webcrypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: new Uint8Array(32),
+      info: new TextEncoder().encode(info),
+    },
+    key,
+    bytes * 8
+  );
+  return bits;
+}
+
+async function hmacSha256(key: ArrayBuffer, data: ArrayBuffer): Promise<ArrayBuffer> {
+  const keyObject = await webcrypto.subtle.importKey(
+    "raw",
+    key,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+  return await webcrypto.subtle.sign("HMAC", keyObject, data);
+}
+
+function truncateArrayBuffer(input: ArrayBuffer, bytes: number): ArrayBuffer {
+  return input.slice(0, bytes);
+}
+
+function randomPaddingBase64(targetBytes = 32): string {
+  return base64FromArrayBuffer(randomBytes(targetBytes));
+}
+
+export function buildOmemoSceEnvelope(text: string, from: string): XmppElement {
+  return xml(
+    "envelope",
+    { xmlns: NS_SCE },
+    xml("content", {}, xml("body", { xmlns: NS_JABBER_CLIENT }, text)),
+    xml("rpad", {}, randomPaddingBase64()),
+    xml("from", { jid: from })
+  );
+}
+
+export function extractBodyFromSceEnvelopeString(input: string): string | null {
+  try {
+    const envelope = parseXml(input);
+    const content = envelope?.getChild("content", NS_SCE) ?? envelope?.getChild("content");
+    const body =
+      content?.getChild("body", NS_JABBER_CLIENT) ??
+      content?.getChild("body") ??
+      envelope?.getChild("body", NS_JABBER_CLIENT) ??
+      envelope?.getChild("body");
+    const text = body?.text?.()?.trim();
+    return text || null;
+  } catch {
+    const match = input.match(/<body(?:\s[^>]*)?>([\s\S]*?)<\/body>/i);
+    return match?.[1]?.trim() || null;
+  }
 }
 
 function isXmppItemNotFoundError(error: unknown): boolean {
@@ -466,7 +530,8 @@ function extractOmemoEncryptedSnapshot(stanza: XmppElement): XmppOmemoEncryptedI
 
   const header = encrypted.getChild("header", NS_OMEMO) ?? encrypted.getChild("header");
   const recipientDeviceIds = uniqueSortedNumbers(
-    elementChildren(header, "key")
+    elementChildren(header, "keys")
+      .flatMap((keys) => elementChildren(keys, "key"))
       .map((key) => parseNumericAttr(key.attrs.rid))
       .filter((value): value is number => value !== undefined)
   );
@@ -476,7 +541,9 @@ function extractOmemoEncryptedSnapshot(stanza: XmppElement): XmppOmemoEncryptedI
     sid: parseNumericAttr(header?.attrs.sid),
     recipientDeviceIds,
     payloadBytes: Buffer.byteLength(payload, "utf8"),
-    isPreKeyMessage: elementChildren(header, "key").some((key) => key.attrs.prekey === "true"),
+    isPreKeyMessage: elementChildren(header, "keys")
+      .flatMap((keys) => elementChildren(keys, "key"))
+      .some((key) => key.attrs.kex === "true" || key.attrs.prekey === "true"),
     decrypted: false,
   };
 }
@@ -1123,7 +1190,9 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     to: string,
     text: string
   ): Promise<XmppElement> {
-    const deviceList = await this.refreshRecipientDeviceList(to);
+    const recipientBareJid = normalizeContactJid(to);
+    const senderBareJid = normalizeContactJid(this.account.jid);
+    const deviceList = await this.refreshRecipientDeviceList(recipientBareJid);
     if (deviceList.fetchError) {
       throw new Error(`recipient device discovery failed: ${deviceList.fetchError}`);
     }
@@ -1131,17 +1200,17 @@ class DefaultXmppOmemoController implements XmppOmemoController {
       throw new Error("recipient has no published OMEMO device list");
     }
 
-    const payload = await this.encryptPayload(text);
-    const keyElements: XmppElement[] = [];
+    const payload = await this.encryptPayload(text, senderBareJid);
+    const recipientKeyElements: XmppElement[] = [];
     const errors: string[] = [];
 
     for (const deviceId of deviceList.deviceIds) {
       try {
-        const address = new SignalProtocolAddress(to, deviceId);
+        const address = new SignalProtocolAddress(recipientBareJid, deviceId);
         const cipher = new SessionCipher(this.signalStore, address);
         const existingSession = await cipher.hasOpenSession();
         if (!existingSession) {
-          const bundleResult = await this.refreshRecipientBundle(to, deviceId);
+          const bundleResult = await this.refreshRecipientBundle(recipientBareJid, deviceId);
           if (!bundleResult.bundle) {
             throw new Error(bundleResult.fetchError ?? "recipient bundle unavailable");
           }
@@ -1152,9 +1221,9 @@ class DefaultXmppOmemoController implements XmppOmemoController {
         const encryptedKey = await cipher.encrypt(payload.keyAndTag);
         const attrs: Record<string, string> = { rid: String(deviceId) };
         if (encryptedKey.type === 3) {
-          attrs.prekey = "true";
+          attrs.kex = "true";
         }
-        keyElements.push(
+        recipientKeyElements.push(
           xml("key", attrs, base64FromArrayBuffer(arrayBufferFromBinaryString(encryptedKey.body ?? "")))
         );
       } catch (error) {
@@ -1162,7 +1231,7 @@ class DefaultXmppOmemoController implements XmppOmemoController {
       }
     }
 
-    if (keyElements.length === 0) {
+    if (recipientKeyElements.length === 0) {
       throw new Error(errors[0] ?? "unable to encrypt for any recipient device");
     }
 
@@ -1176,12 +1245,7 @@ class DefaultXmppOmemoController implements XmppOmemoController {
       xml(
         "encrypted",
         { xmlns: NS_OMEMO },
-        xml(
-          "header",
-          { sid: String(this.state.signal.deviceId) },
-          ...keyElements,
-          xml("iv", {}, payload.iv)
-        ),
+        xml("header", { sid: String(this.state.signal.deviceId) }, buildOmemoKeysElement(recipientBareJid, recipientKeyElements)),
         xml("payload", {}, payload.payload)
       ),
       xml("store", { xmlns: NS_HINTS }),
@@ -1189,30 +1253,31 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     );
   }
 
-  private async encryptPayload(text: string): Promise<XmppOmemoPayloadMaterial> {
-    const iv = randomBytes(AES_GCM_IV_BYTES);
-    const key = randomBytes(KEY_BYTES);
+  private async encryptPayload(text: string, from: string): Promise<XmppOmemoPayloadMaterial> {
+    const plaintext = utf8ArrayBuffer(buildOmemoSceEnvelope(text, from).toString());
+    const key = randomBytes(PAYLOAD_KEY_BYTES);
+    const derived = new Uint8Array(await hkdfSha256(key, HKDF_INFO_PAYLOAD, HKDF_BYTES));
+    const encryptionKey = asArrayBuffer(derived.slice(0, 32));
+    const authenticationKey = asArrayBuffer(derived.slice(32, 64));
+    const iv = asArrayBuffer(derived.slice(64, 80));
     const keyObject = await webcrypto.subtle.importKey(
       "raw",
-      key,
-      { name: "AES-GCM", length: AES_GCM_KEY_LENGTH },
+      encryptionKey,
+      { name: "AES-CBC", length: AES_PAYLOAD_KEY_LENGTH },
       false,
       ["encrypt", "decrypt"]
     );
-    const encrypted = await webcrypto.subtle.encrypt(
-      { name: "AES-GCM", iv: new Uint8Array(iv), tagLength: AES_GCM_TAG_LENGTH },
+    const ciphertext = await webcrypto.subtle.encrypt(
+      { name: "AES-CBC", iv: new Uint8Array(iv) },
       keyObject,
-      utf8ArrayBuffer(text)
+      plaintext
     );
-    const encryptedBytes = new Uint8Array(encrypted);
-    const ciphertext = encryptedBytes.slice(0, encryptedBytes.byteLength - TAG_BYTES);
-    const tag = encryptedBytes.slice(encryptedBytes.byteLength - TAG_BYTES);
+    const tag = truncateArrayBuffer(await hmacSha256(authenticationKey, ciphertext), TAG_BYTES);
     return {
       key,
-      tag: asArrayBuffer(tag),
-      keyAndTag: concatArrayBuffers(key, asArrayBuffer(tag)),
-      iv: base64FromArrayBuffer(iv),
-      payload: base64FromArrayBuffer(asArrayBuffer(ciphertext)),
+      tag,
+      keyAndTag: concatArrayBuffers(key, tag),
+      payload: base64FromArrayBuffer(ciphertext),
     };
   }
 
@@ -1220,7 +1285,6 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     const encrypted = stanza.getChild("encrypted", NS_OMEMO);
     const header = encrypted?.getChild("header", NS_OMEMO) ?? encrypted?.getChild("header");
     const payloadText = encrypted?.getChildText("payload", NS_OMEMO) ?? encrypted?.getChildText("payload");
-    const ivText = header?.getChildText("iv", NS_OMEMO) ?? header?.getChildText("iv");
     const sid = parseNumericAttr(header?.attrs.sid);
 
     if (!header || !sid) {
@@ -1228,29 +1292,36 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     }
 
     const decryptedHeader = await this.decryptHeaderKey(from, sid, header);
-    if (!payloadText || !ivText) {
+    if (!payloadText) {
       throw new Error("OMEMO key transport message received without payload support");
     }
 
     const payloadBytes = arrayBufferFromBase64(payloadText);
-    const cipherWithTag = concatArrayBuffers(payloadBytes, decryptedHeader.tag);
+    const derived = new Uint8Array(await hkdfSha256(decryptedHeader.key, HKDF_INFO_PAYLOAD, HKDF_BYTES));
+    const encryptionKey = asArrayBuffer(derived.slice(0, 32));
+    const authenticationKey = asArrayBuffer(derived.slice(32, 64));
+    const iv = asArrayBuffer(derived.slice(64, 80));
+    const actualTag = truncateArrayBuffer(await hmacSha256(authenticationKey, payloadBytes), TAG_BYTES);
+    if (!timingSafeEqual(Buffer.from(actualTag), Buffer.from(decryptedHeader.tag))) {
+      throw new Error("OMEMO payload authentication failed");
+    }
     const keyObject = await webcrypto.subtle.importKey(
       "raw",
-      decryptedHeader.key,
-      { name: "AES-GCM", length: AES_GCM_KEY_LENGTH },
+      encryptionKey,
+      { name: "AES-CBC", length: AES_PAYLOAD_KEY_LENGTH },
       false,
       ["encrypt", "decrypt"]
     );
     const plaintext = await webcrypto.subtle.decrypt(
       {
-        name: "AES-GCM",
-        iv: new Uint8Array(arrayBufferFromBase64(ivText)),
-        tagLength: AES_GCM_TAG_LENGTH,
+        name: "AES-CBC",
+        iv: new Uint8Array(iv),
       },
       keyObject,
-      cipherWithTag
+      payloadBytes
     );
-    return utf8FromArrayBuffer(plaintext);
+    const envelope = utf8FromArrayBuffer(plaintext);
+    return extractBodyFromSceEnvelopeString(envelope) ?? envelope;
   }
 
   private async decryptHeaderKey(
@@ -1259,7 +1330,11 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     header: XmppElement
   ): Promise<XmppOmemoDecryptedHeader> {
     const ourDeviceId = this.state.signal.deviceId;
-    const keyEl = elementChildren(header, "key").find(
+    const ownBareJid = normalizeContactJid(this.account.jid);
+    const keysEl = elementChildren(header, "keys").find(
+      (candidate) => normalizeXmppBareJid(candidate.attrs.jid) === ownBareJid
+    );
+    const keyEl = elementChildren(keysEl, "key").find(
       (candidate) => parseNumericAttr(candidate.attrs.rid) === ourDeviceId
     );
     if (!keyEl?.text?.()) {
@@ -1269,20 +1344,20 @@ class DefaultXmppOmemoController implements XmppOmemoController {
     const encryptedKey = arrayBufferFromBase64(keyEl.text());
     const address = new SignalProtocolAddress(from, sid);
     const cipher = new SessionCipher(this.signalStore, address);
-    const decrypted = keyEl.attrs.prekey === "true"
+    const decrypted = keyEl.attrs.kex === "true" || keyEl.attrs.prekey === "true"
       ? await cipher.decryptPreKeyWhisperMessage(binaryStringFromArrayBuffer(encryptedKey), "binary")
       : await cipher.decryptWhisperMessage(binaryStringFromArrayBuffer(encryptedKey), "binary");
 
     const raw = new Uint8Array(decrypted);
-    if (raw.byteLength < KEY_BYTES + TAG_BYTES) {
+    if (raw.byteLength < PAYLOAD_KEY_BYTES + TAG_BYTES) {
       throw new Error(`invalid decrypted OMEMO key material length ${raw.byteLength}`);
     }
 
     return {
-      key: asArrayBuffer(raw.slice(0, KEY_BYTES)),
-      tag: asArrayBuffer(raw.slice(KEY_BYTES, KEY_BYTES + TAG_BYTES)),
+      key: asArrayBuffer(raw.slice(0, PAYLOAD_KEY_BYTES)),
+      tag: asArrayBuffer(raw.slice(PAYLOAD_KEY_BYTES, PAYLOAD_KEY_BYTES + TAG_BYTES)),
       sid,
-      isPreKey: keyEl.attrs.prekey === "true",
+      isPreKey: keyEl.attrs.kex === "true" || keyEl.attrs.prekey === "true",
     };
   }
 
