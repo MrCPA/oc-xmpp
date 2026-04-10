@@ -39,6 +39,7 @@
   "scripts": {
     "build": "node build.mjs",
     "prepack": "node build.mjs",
+    "test": "tsx --test tests/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
@@ -46,6 +47,7 @@
   },
   "devDependencies": {
     "esbuild": "^0.28.0",
+    "tsx": "^4.20.6",
     "typescript": "^5.8.0"
   },
   "dependencies": {

@@ -10,8 +10,14 @@ import { dispatchInboundReplyWithBase } from "openclaw/plugin-sdk/inbound-reply-
 import type { PluginRuntime, OpenClawConfig } from "openclaw/plugin-sdk/core";
 
 import { parseXmppJid, normalizeXmppBareJid } from "./ids.js";
-import { sendXmppTextMessage } from "./send.js";
 import type { XmppOmemoController } from "./omemo.js";
+import {
+  createSeenMessageTracker,
+  isXmppSenderAllowed,
+  shouldHandleRoomMessage,
+  shouldIgnoreDelayedRoomMessage,
+} from "./policy.js";
+import { sendXmppTextMessage } from "./send.js";
 import type { ResolvedXmppAccount } from "./channel.js";
 
 interface XmppGatewayContext {
@@ -26,9 +32,6 @@ interface XmppGatewayContext {
   };
   setStatus?: (status: Record<string, unknown>) => void;
 }
-
-const MAX_SEEN_MESSAGE_IDS = 500;
-const ROOM_HISTORY_REPLAY_MAX_AGE_MS = 2 * 60 * 1000;
 
 function extractText(payload: unknown): string {
   if (payload && typeof payload === "object" && "text" in payload) {
@@ -46,32 +49,6 @@ function xmppMessageId(stanza: XmppElement, fallbackSeed: string): string {
 
 function senderDisplayName(fromBare: string, resource?: string): string {
   return resource?.trim() || fromBare;
-}
-
-function isXmppSenderAllowed(senderJid: string, allowFrom: string[]): boolean {
-  const normalizedSender = normalizeXmppBareJid(senderJid);
-  if (!normalizedSender) return false;
-
-  for (const entry of allowFrom) {
-    const normalized = entry.trim().toLowerCase();
-    if (!normalized) continue;
-    if (normalized === "*") return true;
-    if (normalizeXmppBareJid(normalized) === normalizedSender) return true;
-  }
-
-  return false;
-}
-
-function resolveRoomAllowlist(account: ResolvedXmppAccount): string[] {
-  return (account.groups.allowed ?? [])
-    .map((value) => normalizeXmppBareJid(value))
-    .filter((value): value is string => Boolean(value));
-}
-
-function isRoomAllowed(account: ResolvedXmppAccount, roomJid: string): boolean {
-  if ((account.groups.policy ?? "allowlist") === "all") return true;
-  const allowed = resolveRoomAllowlist(account);
-  return allowed.includes(roomJid);
 }
 
 function resolveMucNick(account: ResolvedXmppAccount): string {
@@ -96,63 +73,10 @@ function hasDelayStamp(stanza: XmppElement): boolean {
   return Boolean(stanza.getChild("delay", "urn:xmpp:delay")?.attrs.stamp);
 }
 
-function markSeenMessage(seen: Map<string, number>, key: string): boolean {
-  if (seen.has(key)) return false;
-  seen.set(key, Date.now());
-  while (seen.size > MAX_SEEN_MESSAGE_IDS) {
-    const oldest = seen.keys().next();
-    if (oldest.done) break;
-    seen.delete(oldest.value);
-  }
-  return true;
-}
-
 function extractMucRealJid(stanza: XmppElement): string | undefined {
   const x = stanza.getChild("x", "http://jabber.org/protocol/muc#user");
   const jid = x?.getChild("item")?.attrs.jid;
   return normalizeXmppBareJid(jid ?? "");
-}
-
-function wasMentioned(text: string, nick: string): boolean {
-  const trimmedNick = nick.trim();
-  if (!trimmedNick) return false;
-  const escaped = trimmedNick.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(`(^|\\b|[^a-z0-9_])${escaped}([,:]?\\b|$)`, "i");
-  return pattern.test(text);
-}
-
-function shouldHandleRoomMessage(params: {
-  account: ResolvedXmppAccount;
-  roomJid: string;
-  senderRealJid?: string;
-  text: string;
-  botNick: string;
-}): { allow: boolean; wasMentioned: boolean } {
-  const { account, roomJid, senderRealJid, text, botNick } = params;
-
-  if (!isRoomAllowed(account, roomJid)) {
-    return { allow: false, wasMentioned: false };
-  }
-
-  const mentioned = wasMentioned(text, botNick);
-  const replyPolicy = account.groups.replyPolicy ?? "mention-only";
-
-  if (replyPolicy === "open") {
-    return { allow: true, wasMentioned: mentioned };
-  }
-
-  if (replyPolicy === "mention-only") {
-    return { allow: mentioned, wasMentioned: mentioned };
-  }
-
-  if (replyPolicy === "dm-allowlist") {
-    return {
-      allow: Boolean(senderRealJid && isXmppSenderAllowed(senderRealJid, account.allowFrom)),
-      wasMentioned: mentioned,
-    };
-  }
-
-  return { allow: false, wasMentioned: mentioned };
 }
 
 async function joinConfiguredRooms(params: {
@@ -161,7 +85,7 @@ async function joinConfiguredRooms(params: {
   log?: XmppGatewayContext["log"];
   setStatus?: XmppGatewayContext["setStatus"];
 }): Promise<void> {
-  const rooms = resolveRoomAllowlist(params.account);
+  const rooms = params.account.groups.allowed ?? [];
   if (rooms.length === 0) {
     params.setStatus?.({ joinedRooms: 0 });
     return;
@@ -202,7 +126,7 @@ export async function startXmppInboundLoop(
   }
 
   const botNick = resolveMucNick(ctx.account);
-  const seenMessageIds = new Map<string, number>();
+  const seenMessageIds = createSeenMessageTracker();
   const pairing = createChannelPairingController({
     core: runtime,
     channel: "xmpp",
@@ -395,7 +319,7 @@ export async function startXmppInboundLoop(
     if (!from?.bare) return;
 
     const timestamp = extractTimestamp(stanza);
-    if (hasDelayStamp(stanza) && Date.now() - timestamp > ROOM_HISTORY_REPLAY_MAX_AGE_MS) {
+    if (shouldIgnoreDelayedRoomMessage({ isDelayed: hasDelayStamp(stanza), timestamp })) {
       ctx.log?.debug?.(
         `[${ctx.account.accountId}] ignoring delayed XMPP room history for ${from.bare}`
       );
@@ -408,9 +332,12 @@ export async function startXmppInboundLoop(
 
     const senderRealJid = extractMucRealJid(stanza);
     const gate = shouldHandleRoomMessage({
-      account: ctx.account,
       roomJid: from.bare,
+      roomPolicy: ctx.account.groups.policy,
+      allowedRooms: ctx.account.groups.allowed,
+      replyPolicy: ctx.account.groups.replyPolicy,
       senderRealJid,
+      dmAllowFrom: ctx.account.allowFrom,
       text: rawBody,
       botNick,
     });
@@ -501,7 +428,7 @@ export async function startXmppInboundLoop(
     const from = parseXmppJid(stanza.attrs.from ?? "");
     const dedupeFrom = from?.bare ?? String(stanza.attrs.from ?? "unknown");
     const messageKey = `${dedupeFrom}#${xmppMessageId(stanza, dedupeFrom)}`;
-    if (!markSeenMessage(seenMessageIds, messageKey)) {
+    if (!seenMessageIds.mark(messageKey)) {
       ctx.log?.debug?.(
         `[${ctx.account.accountId}] skipping duplicate XMPP message ${messageKey}`
       );

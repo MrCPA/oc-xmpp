@@ -15,6 +15,11 @@ import {
   parseXmppTarget,
   resolveXmppSessionConversation,
 } from "./ids.js";
+import {
+  normalizeXmppJidArray,
+  normalizeStringArray,
+  validateXmppSetupInput,
+} from "./policy.js";
 import { getXmppRuntime } from "./runtime.js";
 import type {
   ResolvedXmppOmemoConfig,
@@ -74,20 +79,6 @@ interface ActiveAccount {
 }
 
 const activeAccounts = new Map<string, ActiveAccount>();
-
-function normalizeStringArray(values: unknown): string[] {
-  if (!Array.isArray(values)) return [];
-  return values
-    .map((value) => (typeof value === "string" ? value.trim() : ""))
-    .filter((value): value is string => Boolean(value));
-}
-
-function normalizeXmppJidArray(values: unknown): string[] {
-  const normalized = normalizeStringArray(values)
-    .map((value) => normalizeXmppBareJid(value))
-    .filter((value): value is string => Boolean(value));
-  return [...new Set(normalized)];
-}
 
 function createDisabledOmemoController(
   config: ResolvedXmppOmemoConfig,
@@ -188,7 +179,7 @@ function applySetupInput(
         mucService: input.mucService ?? current.mucService,
         dm: {
           policy: current.dm?.policy ?? "allowlist",
-          allowFrom: input.dmAllowlist ?? current.dm?.allowFrom ?? [],
+          allowFrom: normalizeStringArray(input.dmAllowlist ?? current.dm?.allowFrom ?? []),
         },
         groups: current.groups ?? {},
       },
@@ -210,19 +201,11 @@ const xmppSetupAdapter = {
   resolveAccountId: () => DEFAULT_ACCOUNT_ID,
   validateInput: ({ cfg, input }: { cfg: OpenClawConfig; input: any }) => {
     const section = getXmppSection(cfg);
-    const jid = String(input.userId ?? section?.jid ?? "").trim();
-    const password = String(input.token ?? section?.password ?? "");
-    const service = String(input.url ?? section?.service ?? "").trim();
-
-    if (!jid || !password || !service) {
-      return "XMPP setup needs userId (JID), token (password), and url (service URL).";
-    }
-
-    if (!normalizeXmppBareJid(jid)) {
-      return "XMPP setup userId must be a valid bare JID like bot@example.com.";
-    }
-
-    return null;
+    return validateXmppSetupInput({
+      jid: input.userId ?? section?.jid,
+      password: input.token ?? section?.password,
+      service: input.url ?? section?.service,
+    });
   },
   applyAccountConfig: ({ cfg, input }: { cfg: OpenClawConfig; input: any }) =>
     applySetupInput(cfg, {

@@ -2,7 +2,7 @@
 
 Scaffold for an OpenClaw XMPP channel plugin.
 
-Current status: package skeleton, OpenClaw channel wiring, XMPP conversation/target grammar, transport/login lifecycle, first-pass inbound handling, outbound text delivery, pairing approval notification, and direct-message OMEMO now exist. The plugin normalizes bare JIDs, understands explicit `dm:` and `room:` targets, connects/login with `@xmpp/client`, auto-joins configured rooms, routes direct messages through OpenClaw DM policy/pairing checks, routes groupchat messages with room allowlist and reply-policy gating, sends text replies back for inbound conversations, and can deliver outbound text to direct JIDs or rooms. Hardening work now also includes safer startup/shutdown behavior, normalized config allowlists, duplicate inbound message suppression, and replay protection for older delayed room history after reconnects. Media is still basic: outbound media currently degrades to a plain text message with the media URL instead of native XMPP upload. Presence filtering is still basic, and live testing against `talk.ruzicka.us` is still TODO.
+Current status: package skeleton, OpenClaw channel wiring, XMPP conversation/target grammar, transport/login lifecycle, first-pass inbound handling, outbound text delivery, pairing approval notification, and direct-message OMEMO now exist. The plugin normalizes bare JIDs, understands explicit `dm:` and `room:` targets, connects/login with `@xmpp/client`, auto-joins configured rooms, routes direct messages through OpenClaw DM policy/pairing checks, routes groupchat messages with room allowlist and reply-policy gating, sends text replies back for inbound conversations, and can deliver outbound text to direct JIDs or rooms. Hardening work now also includes safer startup/shutdown behavior, normalized config allowlists, duplicate inbound message suppression, replay protection for older delayed room history after reconnects, and a focused Node 22 test harness covering target parsing, setup validation, access policy, delayed replay filtering, and dedupe behavior. Media is still basic: outbound media currently degrades to a plain text message with the media URL instead of native XMPP upload. Presence filtering is still basic, and live testing against `talk.ruzicka.us` is still TODO.
 
 ## OMEMO status
 
@@ -34,11 +34,18 @@ Current limits:
 
 Because this now depends on `@privacyresearch/libsignal-protocol-typescript` (`GPL-3.0-only`), this package is licensed `GPL-3.0-only` as well.
 
+## Testing
+
+- `npm run build`
+- `npm test`
+
+The current test harness is intentionally focused on high-risk behavior: target parsing, setup validation, sender/room policy decisions, delayed-history filtering, and duplicate-message suppression.
+
 Next steps:
 
 1. Interop test against real OMEMO clients on Prosody.
 2. Tighten trust/fingerprint policy and operator visibility.
 3. Improve device-change handling and stale-session recovery.
-4. Add automated integration tests against a disposable XMPP server, especially reconnect, duplicate-delivery, delayed-history, and OMEMO optional/required cases.
+4. Add disposable-server integration coverage for reconnect, real stanza replay, and OMEMO optional/required flows.
 5. Tighten mention/presence filtering and remaining MUC edge cases.
 6. Add native media upload support if we want real attachments.
