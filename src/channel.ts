@@ -106,9 +106,9 @@ function resolveAccount(
   accountId?: string | null
 ): ResolvedXmppAccount {
   const section = getXmppSection(cfg);
-  const jid = section?.jid ?? "";
+  const jid = section?.jid?.trim() ?? "";
   const password = section?.password ?? "";
-  const service = section?.service ?? "";
+  const service = section?.service?.trim() ?? "";
   const configured = Boolean(jid && password && service);
 
   return {
@@ -503,11 +503,29 @@ export const xmppPlugin = createChatChannelPlugin({
         const stop = async () => {
           if (stopped) return;
           stopped = true;
-          await inbound.stop();
-          await omemo.stop();
-          await lifecycle.stop();
+
+          const results = await Promise.allSettled([
+            inbound.stop(),
+            omemo.stop(),
+            lifecycle.stop(),
+          ]);
+
           activeAccounts.delete(account.accountId);
-          ctx.log?.info?.(`[${account.accountId}] XMPP provider stopped`);
+
+          const failures = results
+            .map((result, index) => ({ result, label: ["inbound", "omemo", "transport"][index] }))
+            .filter((entry): entry is { result: PromiseRejectedResult; label: string } => entry.result.status === "rejected");
+
+          if (failures.length > 0) {
+            const message = failures
+              .map((entry) => `${entry.label}: ${String(entry.result.reason)}`)
+              .join("; ");
+            ctx.log?.warn?.(
+              `[${account.accountId}] XMPP provider stop completed with errors: ${message}`
+            );
+          } else {
+            ctx.log?.info?.(`[${account.accountId}] XMPP provider stopped`);
+          }
         };
 
         activeAccounts.set(account.accountId, {

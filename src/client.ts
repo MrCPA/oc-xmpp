@@ -43,6 +43,20 @@ function splitLocalAndDomain(bareJid: string): {
   };
 }
 
+function summarizeStanza(stanza: {
+  attrs?: Record<string, unknown>;
+  getChildText?: (name: string) => string | undefined;
+  is?: (name: string) => boolean;
+}): string {
+  const from = typeof stanza.attrs?.from === "string" ? stanza.attrs.from : "unknown";
+  const to = typeof stanza.attrs?.to === "string" ? stanza.attrs.to : "unknown";
+  const id = typeof stanza.attrs?.id === "string" ? stanza.attrs.id : "";
+  const type = typeof stanza.attrs?.type === "string" ? stanza.attrs.type : "";
+  const body = typeof stanza.getChildText === "function" ? stanza.getChildText("body")?.trim() ?? "" : "";
+  const bodyPreview = body ? ` body=${JSON.stringify(body.slice(0, 120))}` : "";
+  return `kind=${stanza.is?.("message") ? "message" : stanza.is?.("presence") ? "presence" : "stanza"} from=${from} to=${to}${id ? ` id=${id}` : ""}${type ? ` type=${type}` : ""}${bodyPreview}`;
+}
+
 export async function startXmppTransport(
   params: StartXmppTransportParams
 ): Promise<XmppTransportLifecycle> {
@@ -135,9 +149,9 @@ export async function startXmppTransport(
     });
   });
 
-  xmpp.on("stanza", (stanza: { is?: (name: string) => boolean; toString(): string }) => {
+  xmpp.on("stanza", (stanza: { is?: (name: string) => boolean; attrs?: Record<string, unknown>; getChildText?: (name: string) => string | undefined }) => {
     if (stanza?.is?.("message") || stanza?.is?.("presence")) {
-      log?.debug?.(`[${account.accountId}] received stanza ${stanza.toString()}`);
+      log?.debug?.(`[${account.accountId}] received stanza ${summarizeStanza(stanza)}`);
     }
   });
 
@@ -149,6 +163,12 @@ export async function startXmppTransport(
       await xmpp.stop();
       settleResolve();
     } catch (error) {
+      const message = String(error);
+      log?.warn?.(`[${account.accountId}] XMPP transport stop error: ${message}`);
+      updateStatus({
+        transportState: "stop-error",
+        transportStopError: message,
+      });
       settleReject(error);
       throw error;
     }
