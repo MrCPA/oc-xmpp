@@ -38,8 +38,11 @@ Because this now depends on `@privacyresearch/libsignal-protocol-typescript` (`G
 
 - `npm run build`
 - `npm test`
+- `bash scripts/run-canary-checks.sh`
 
 The current test harness is intentionally focused on high-risk behavior: target parsing, setup validation, sender/room policy decisions, delayed-history filtering, duplicate-message suppression, stanza-flow helper behavior such as self-message and empty-body suppression, and transport lifecycle behavior such as failed starts, abort-driven shutdown, and stop-error surfacing.
+
+For real-world validation, use `docs/CANARY.md` plus `scripts/run-canary-checks.sh` with a non-production bot account and room.
 
 Next steps:
 
