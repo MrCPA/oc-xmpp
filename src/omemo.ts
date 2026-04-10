@@ -329,6 +329,11 @@ function omemoBundleNode(deviceId: number): string {
   return `${OMEMO_BUNDLES_PREFIX}${deviceId}`;
 }
 
+function isXmppItemNotFoundError(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("item-not-found");
+}
+
 function generateOmemoDeviceId(): number {
   return randomInt(1, 0x7fffffff);
 }
@@ -887,19 +892,19 @@ class DefaultXmppOmemoController implements XmppOmemoController {
       }
     }
 
-    const items = await this.fetchPubsubItems(to, OMEMO_DEVICELIST_NODE);
-    if (!items) {
-      const snapshot: XmppOmemoDeviceListResult = {
-        fetchedAt: nowIso(),
-        deviceIds: [],
-        fetchError: "xmpp iqCaller unavailable",
-      };
-      contact.deviceList = snapshot;
-      await this.persistState();
-      return snapshot;
-    }
-
     try {
+      const items = await this.fetchPubsubItems(to, OMEMO_DEVICELIST_NODE);
+      if (!items) {
+        const snapshot: XmppOmemoDeviceListResult = {
+          fetchedAt: nowIso(),
+          deviceIds: [],
+          fetchError: "xmpp iqCaller unavailable",
+        };
+        contact.deviceList = snapshot;
+        await this.persistState();
+        return snapshot;
+      }
+
       const snapshot: XmppOmemoDeviceListResult = {
         fetchedAt: nowIso(),
         deviceIds: extractDeviceList(items),
@@ -913,11 +918,18 @@ class DefaultXmppOmemoController implements XmppOmemoController {
         deviceIds: [],
         fetchError: String(error),
       };
+      if (isXmppItemNotFoundError(error)) {
+        delete snapshot.fetchError;
+        this.log?.info?.(
+          `[${this.account.accountId}] OMEMO device-list node missing for ${to}, treating as empty`
+        );
+      } else {
+        this.log?.warn?.(
+          `[${this.account.accountId}] OMEMO device-list fetch failed for ${to}: ${snapshot.fetchError}`
+        );
+      }
       contact.deviceList = snapshot;
       await this.persistState();
-      this.log?.warn?.(
-        `[${this.account.accountId}] OMEMO device-list fetch failed for ${to}: ${snapshot.fetchError}`
-      );
       return snapshot;
     }
   }
