@@ -27,6 +27,9 @@ interface XmppGatewayContext {
   setStatus?: (status: Record<string, unknown>) => void;
 }
 
+const MAX_SEEN_MESSAGE_IDS = 500;
+const ROOM_HISTORY_REPLAY_MAX_AGE_MS = 2 * 60 * 1000;
+
 function extractText(payload: unknown): string {
   if (payload && typeof payload === "object" && "text" in payload) {
     return String((payload as any).text ?? "");
@@ -87,6 +90,21 @@ function extractTimestamp(stanza: XmppElement): number {
     if (Number.isFinite(parsed)) return parsed;
   }
   return Date.now();
+}
+
+function hasDelayStamp(stanza: XmppElement): boolean {
+  return Boolean(stanza.getChild("delay", "urn:xmpp:delay")?.attrs.stamp);
+}
+
+function markSeenMessage(seen: Map<string, number>, key: string): boolean {
+  if (seen.has(key)) return false;
+  seen.set(key, Date.now());
+  while (seen.size > MAX_SEEN_MESSAGE_IDS) {
+    const oldest = seen.keys().next();
+    if (oldest.done) break;
+    seen.delete(oldest.value);
+  }
+  return true;
 }
 
 function extractMucRealJid(stanza: XmppElement): string | undefined {
@@ -184,11 +202,39 @@ export async function startXmppInboundLoop(
   }
 
   const botNick = resolveMucNick(ctx.account);
+  const seenMessageIds = new Map<string, number>();
   const pairing = createChannelPairingController({
     core: runtime,
     channel: "xmpp",
     accountId: ctx.account.accountId,
   });
+
+  const resolveMarkdownTableMode = () =>
+    runtime.channel.text.resolveMarkdownTableMode({
+      cfg: ctx.cfg,
+      channel: "xmpp",
+      accountId: ctx.account.accountId,
+    });
+
+  const convertOutboundText = (text: string) =>
+    runtime.channel.text.convertMarkdownTables(text, resolveMarkdownTableMode());
+
+  async function deliverText(params: {
+    to: string;
+    text: string;
+    chatType: "direct" | "channel";
+    useOmemo?: boolean;
+  }) {
+    const trimmed = params.text.trim();
+    if (!trimmed) return;
+    await sendXmppTextMessage({
+      client,
+      omemo: params.useOmemo === false ? undefined : ctx.omemo,
+      to: params.to,
+      text: convertOutboundText(trimmed),
+      chatType: params.chatType,
+    });
+  }
 
   async function resolveAccess(senderId: string, rawBody: string) {
     return resolveInboundDirectDmAccessWithRuntime({
@@ -236,166 +282,32 @@ export async function startXmppInboundLoop(
     },
   });
 
-  const handleDirectMessage = async (stanza: XmppElement) => {
-    const from = parseXmppJid(stanza.attrs.from ?? "");
-    if (!from?.bare || from.bare === botBareJid) return;
-
-    const encryptedResult = await ctx.omemo?.handleInboundEncryptedDm({
-      from: from.bare,
-      stanza,
-      reply: async (text) => {
-        await sendXmppTextMessage({
-          client,
-          to: from.bare,
-          text,
-          chatType: "direct",
-        });
-      },
-    });
-    if (encryptedResult?.handled) {
-      if (!encryptedResult.body?.trim()) return;
-      const rawBody = encryptedResult.body.trim();
-
-      const decision = await authorizeSender({
-        senderId: from.bare,
-        reply: async (text) => {
-          await sendXmppTextMessage({
-            client,
-            omemo: ctx.omemo,
-            to: from.bare,
-            text,
-            chatType: "direct",
-          });
-        },
-      });
-      if (decision !== "allow") return;
-
-      const resolvedAccess = await resolveAccess(from.bare, rawBody);
-      if (resolvedAccess.access.decision !== "allow") {
-        ctx.log?.warn?.(
-          `[${ctx.account.accountId}] dropping XMPP DM after preflight drift (${from.bare}, ${resolvedAccess.access.reason})`
-        );
-        return;
-      }
-
-      await dispatchInboundDirectDmWithRuntime({
-        cfg: ctx.cfg,
-        runtime,
-        channel: "xmpp",
-        channelLabel: "XMPP",
-        accountId: ctx.account.accountId,
-        peer: { kind: "direct", id: from.bare },
-        senderId: from.bare,
-        senderAddress: `xmpp:${from.bare}`,
-        recipientAddress: `xmpp:${botBareJid}`,
-        conversationLabel: from.bare,
-        rawBody,
-        messageId: xmppMessageId(stanza, from.bare),
-        timestamp: extractTimestamp(stanza),
-        commandAuthorized: resolvedAccess.commandAuthorized,
-        deliver: async (payload) => {
-          const text = extractText(payload);
-          if (!text.trim()) return;
-          const converted = runtime.channel.text.convertMarkdownTables(
-            text,
-            runtime.channel.text.resolveMarkdownTableMode({
-              cfg: ctx.cfg,
-              channel: "xmpp",
-              accountId: ctx.account.accountId,
-            })
-          );
-          await sendXmppTextMessage({
-            client,
-            omemo: ctx.omemo,
-            to: from.bare,
-            text: converted,
-            chatType: "direct",
-          });
-        },
-        onRecordError: (err) => {
-          ctx.log?.error?.(
-            `[${ctx.account.accountId}] failed recording XMPP DM inbound session: ${String(err)}`
-          );
-        },
-        onDispatchError: (err, info) => {
-          ctx.log?.error?.(
-            `[${ctx.account.accountId}] XMPP DM ${info.kind} reply failed: ${String(err)}`
-          );
-        },
-      });
-      return;
-    }
-
-    const rawBody = stanza.getChildText("body")?.trim() ?? "";
-    if (!rawBody) return;
-
-    const allowPlaintext = await ctx.omemo?.allowInboundPlaintextDm({
-      from: from.bare,
-      body: rawBody,
-      reply: async (text) => {
-        await sendXmppTextMessage({
-          client,
-          to: from.bare,
-          text,
-          chatType: "direct",
-        });
-      },
-    });
-    if (allowPlaintext === false) return;
-
-    const decision = await authorizeSender({
-      senderId: from.bare,
-      reply: async (text) => {
-        await sendXmppTextMessage({
-          client,
-          omemo: ctx.omemo,
-          to: from.bare,
-          text,
-          chatType: "direct",
-        });
-      },
-    });
-    if (decision !== "allow") return;
-
-    const resolvedAccess = await resolveAccess(from.bare, rawBody);
-    if (resolvedAccess.access.decision !== "allow") {
-      ctx.log?.warn?.(
-        `[${ctx.account.accountId}] dropping XMPP DM after preflight drift (${from.bare}, ${resolvedAccess.access.reason})`
-      );
-      return;
-    }
-
+  const dispatchDirectMessage = async (params: {
+    stanza: XmppElement;
+    fromBare: string;
+    rawBody: string;
+    commandAuthorized: boolean;
+  }) => {
     await dispatchInboundDirectDmWithRuntime({
       cfg: ctx.cfg,
       runtime,
       channel: "xmpp",
       channelLabel: "XMPP",
       accountId: ctx.account.accountId,
-      peer: { kind: "direct", id: from.bare },
-      senderId: from.bare,
-      senderAddress: `xmpp:${from.bare}`,
+      peer: { kind: "direct", id: params.fromBare },
+      senderId: params.fromBare,
+      senderAddress: `xmpp:${params.fromBare}`,
       recipientAddress: `xmpp:${botBareJid}`,
-      conversationLabel: from.bare,
-      rawBody,
-      messageId: xmppMessageId(stanza, from.bare),
-      timestamp: extractTimestamp(stanza),
-      commandAuthorized: resolvedAccess.commandAuthorized,
+      conversationLabel: params.fromBare,
+      rawBody: params.rawBody,
+      messageId: xmppMessageId(params.stanza, params.fromBare),
+      timestamp: extractTimestamp(params.stanza),
+      commandAuthorized: params.commandAuthorized,
       deliver: async (payload) => {
         const text = extractText(payload);
-        if (!text.trim()) return;
-        const converted = runtime.channel.text.convertMarkdownTables(
+        await deliverText({
+          to: params.fromBare,
           text,
-          runtime.channel.text.resolveMarkdownTableMode({
-            cfg: ctx.cfg,
-            channel: "xmpp",
-            accountId: ctx.account.accountId,
-          })
-        );
-        await sendXmppTextMessage({
-          client,
-          omemo: ctx.omemo,
-          to: from.bare,
-          text: converted,
           chatType: "direct",
         });
       },
@@ -412,9 +324,83 @@ export async function startXmppInboundLoop(
     });
   };
 
+  const handleDirectMessage = async (stanza: XmppElement) => {
+    const from = parseXmppJid(stanza.attrs.from ?? "");
+    if (!from?.bare || from.bare === botBareJid) return;
+
+    const encryptedResult = await ctx.omemo?.handleInboundEncryptedDm({
+      from: from.bare,
+      stanza,
+      reply: async (text) => {
+        await deliverText({
+          to: from.bare,
+          text,
+          chatType: "direct",
+          useOmemo: false,
+        });
+      },
+    });
+
+    const rawBody = encryptedResult?.handled
+      ? encryptedResult.body?.trim() ?? ""
+      : stanza.getChildText("body")?.trim() ?? "";
+    if (!rawBody) return;
+
+    if (!encryptedResult?.handled) {
+      const allowPlaintext = await ctx.omemo?.allowInboundPlaintextDm({
+        from: from.bare,
+        body: rawBody,
+        reply: async (text) => {
+          await deliverText({
+            to: from.bare,
+            text,
+            chatType: "direct",
+            useOmemo: false,
+          });
+        },
+      });
+      if (allowPlaintext === false) return;
+    }
+
+    const decision = await authorizeSender({
+      senderId: from.bare,
+      reply: async (text) => {
+        await deliverText({
+          to: from.bare,
+          text,
+          chatType: "direct",
+        });
+      },
+    });
+    if (decision !== "allow") return;
+
+    const resolvedAccess = await resolveAccess(from.bare, rawBody);
+    if (resolvedAccess.access.decision !== "allow") {
+      ctx.log?.warn?.(
+        `[${ctx.account.accountId}] dropping XMPP DM after preflight drift (${from.bare}, ${resolvedAccess.access.reason})`
+      );
+      return;
+    }
+
+    await dispatchDirectMessage({
+      stanza,
+      fromBare: from.bare,
+      rawBody,
+      commandAuthorized: resolvedAccess.commandAuthorized,
+    });
+  };
+
   const handleRoomMessage = async (stanza: XmppElement) => {
     const from = parseXmppJid(stanza.attrs.from ?? "");
     if (!from?.bare) return;
+
+    const timestamp = extractTimestamp(stanza);
+    if (hasDelayStamp(stanza) && Date.now() - timestamp > ROOM_HISTORY_REPLAY_MAX_AGE_MS) {
+      ctx.log?.debug?.(
+        `[${ctx.account.accountId}] ignoring delayed XMPP room history for ${from.bare}`
+      );
+      return;
+    }
 
     const rawBody = stanza.getChildText("body")?.trim() ?? "";
     if (!rawBody) return;
@@ -445,7 +431,6 @@ export async function startXmppInboundLoop(
       storePath,
       sessionKey: route.sessionKey,
     });
-    const timestamp = extractTimestamp(stanza);
     const displayFrom = senderDisplayName(senderRealJid ?? from.bare, from.resource);
     const body = runtime.channel.reply.formatAgentEnvelope({
       channel: "XMPP",
@@ -491,20 +476,9 @@ export async function startXmppInboundLoop(
       core: runtime,
       deliver: async (payload) => {
         const text = extractText(payload);
-        if (!text.trim()) return;
-        const converted = runtime.channel.text.convertMarkdownTables(
-          text,
-          runtime.channel.text.resolveMarkdownTableMode({
-            cfg: ctx.cfg,
-            channel: "xmpp",
-            accountId: ctx.account.accountId,
-          })
-        );
-        await sendXmppTextMessage({
-          client,
-          omemo: ctx.omemo,
+        await deliverText({
           to: from.bare,
-          text: converted,
+          text,
           chatType: "channel",
         });
       },
@@ -523,6 +497,16 @@ export async function startXmppInboundLoop(
 
   const onStanza = (stanza: XmppElement) => {
     if (!stanza.is("message")) return;
+
+    const from = parseXmppJid(stanza.attrs.from ?? "");
+    const dedupeFrom = from?.bare ?? String(stanza.attrs.from ?? "unknown");
+    const messageKey = `${dedupeFrom}#${xmppMessageId(stanza, dedupeFrom)}`;
+    if (!markSeenMessage(seenMessageIds, messageKey)) {
+      ctx.log?.debug?.(
+        `[${ctx.account.accountId}] skipping duplicate XMPP message ${messageKey}`
+      );
+      return;
+    }
 
     const type = (stanza.attrs.type ?? "chat").toLowerCase();
     void (async () => {

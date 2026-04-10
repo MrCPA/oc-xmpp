@@ -75,6 +75,20 @@ interface ActiveAccount {
 
 const activeAccounts = new Map<string, ActiveAccount>();
 
+function normalizeStringArray(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return values
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter((value): value is string => Boolean(value));
+}
+
+function normalizeXmppJidArray(values: unknown): string[] {
+  const normalized = normalizeStringArray(values)
+    .map((value) => normalizeXmppBareJid(value))
+    .filter((value): value is string => Boolean(value));
+  return [...new Set(normalized)];
+}
+
 function createDisabledOmemoController(
   config: ResolvedXmppOmemoConfig,
   statePath = ".openclaw/xmpp-omemo-disabled.json"
@@ -116,16 +130,20 @@ function resolveAccount(
     jid,
     password,
     service,
-    chatDomain: section?.chatDomain,
-    mucService: section?.mucService,
+    chatDomain: section?.chatDomain?.trim() || undefined,
+    mucService: section?.mucService?.trim() || undefined,
     dmPolicy: section?.dm?.policy ?? "allowlist",
-    allowFrom: section?.dm?.allowFrom ?? [],
-    groups: section?.groups ?? {},
+    allowFrom: normalizeXmppJidArray(section?.dm?.allowFrom),
+    groups: {
+      policy: section?.groups?.policy,
+      allowed: normalizeXmppJidArray(section?.groups?.allowed),
+      replyPolicy: section?.groups?.replyPolicy,
+    },
     omemo: {
       mode: section?.omemo?.mode ?? "off",
       allowUnencryptedFallback: section?.omemo?.allowUnencryptedFallback ?? false,
       replyOnUnsupportedInbound: section?.omemo?.replyOnUnsupportedInbound ?? false,
-      statePath: section?.omemo?.statePath,
+      statePath: section?.omemo?.statePath?.trim() || undefined,
     },
     configured,
     enabled: configured,
@@ -192,12 +210,16 @@ const xmppSetupAdapter = {
   resolveAccountId: () => DEFAULT_ACCOUNT_ID,
   validateInput: ({ cfg, input }: { cfg: OpenClawConfig; input: any }) => {
     const section = getXmppSection(cfg);
-    const jid = input.userId ?? section?.jid;
-    const password = input.token ?? section?.password;
-    const service = input.url ?? section?.service;
+    const jid = String(input.userId ?? section?.jid ?? "").trim();
+    const password = String(input.token ?? section?.password ?? "");
+    const service = String(input.url ?? section?.service ?? "").trim();
 
     if (!jid || !password || !service) {
       return "XMPP setup needs userId (JID), token (password), and url (service URL).";
+    }
+
+    if (!normalizeXmppBareJid(jid)) {
+      return "XMPP setup userId must be a valid bare JID like bot@example.com.";
     }
 
     return null;
