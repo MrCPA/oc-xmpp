@@ -478,6 +478,10 @@ export async function startXmppInboundLoop(
       account: ctx.account,
       log: ctx.log,
       setStatus: ctx.setStatus,
+    }).catch((error) => {
+      ctx.log?.error?.(
+        `[${ctx.account.accountId}] failed joining configured XMPP rooms on online: ${String(error)}`
+      );
     });
   };
 

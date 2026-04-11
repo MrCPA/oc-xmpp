@@ -7,10 +7,10 @@ const globalScope = globalThis as typeof globalThis & { [XMPP_GLOBAL_HOOKS]?: bo
 
 if (!globalScope[XMPP_GLOBAL_HOOKS]) {
   globalScope[XMPP_GLOBAL_HOOKS] = true;
-  process.on("unhandledRejection", (reason) => {
-    console.error("[xmpp] unhandledRejection", reason);
+  process.prependListener("unhandledRejection", (reason, promise) => {
+    console.error("[xmpp] unhandledRejection", { reason, promise });
   });
-  process.on("uncaughtExceptionMonitor", (error, origin) => {
+  process.prependListener("uncaughtExceptionMonitor", (error, origin) => {
     console.error("[xmpp] uncaughtExceptionMonitor", origin, error);
   });
 }
