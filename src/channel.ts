@@ -551,11 +551,16 @@ export const xmppPlugin = createChatChannelPlugin({
 
         try {
           await lifecycle.done;
+          ctx.log?.info?.(`[${account.accountId}] XMPP transport lifecycle completed`);
         } catch (err) {
+          const message = String(err);
           ctx.log?.error?.(
-            `[${account.accountId}] XMPP transport fatal error: ${String(err)}`
+            `[${account.accountId}] XMPP transport fatal error: ${message}`
           );
-          throw err;
+          ctx.setStatus?.({
+            conversationGrammar: true,
+            transportFatalError: message,
+          });
         } finally {
           ctx.abortSignal?.removeEventListener?.("abort", onAbort);
           await stop();
